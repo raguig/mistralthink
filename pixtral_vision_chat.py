@@ -13,6 +13,8 @@ import re
 import io
 import contextlib
 import logging
+import subprocess
+import httpx
 try:
     from ddgs import DDGS
 except ImportError:
@@ -50,6 +52,8 @@ warnings.filterwarnings(
 )
 logging.getLogger("primp").setLevel(logging.ERROR)
 logging.getLogger("ddgs").setLevel(logging.ERROR)
+
+SANDBOX_TIMEOUT_SECONDS = 12
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -138,13 +142,21 @@ def planner_node(state: AgentState):
         f"User query: {query}\n\n"
         "Output ONLY the plan as numbered steps."
     )
-    plan = client.chat.complete(
-        model=MODEL,
-        messages=[{"role": "user", "content": planning_text}],
-        max_tokens=300,
-        temperature=0.2,
-    ).choices[0].message.content
-    plan = normalize_reply_content(plan)
+    try:
+        plan = safe_chat_complete(
+            model=MODEL,
+            messages=[{"role": "user", "content": planning_text}],
+            max_tokens=300,
+            temperature=0.2,
+        ).choices[0].message.content
+        plan = normalize_reply_content(plan)
+    except Exception:
+        plan = (
+            "1. Analyze image trends.\n"
+            "2. Use web_search for recent/similar data.\n"
+            "3. Use code_interpreter to produce and verify improved visualization.\n"
+            "4. Summarize findings with tool evidence."
+        )
 
     return {"plan": plan}
 
@@ -216,6 +228,9 @@ def agent_node(state: AgentState):
         "If asked to analyze trends, include a concise trend analysis. "
         "If asked to search recent/similar data, perform web_search and cite key findings. "
         "If asked to code and verify, run code_interpreter and report execution status.\n\n"
+        "Output requirements for final answer:\n"
+        "1) If web_search was used, include source links from tool output.\n"
+        "2) Keep metric consistency with the uploaded image; if you switch metric, explain why.\n\n"
         f"Plan:\n{plan}\n\nConversation:\n" + "\n".join(convo_lines)
     )
     content = [{"type": "text", "text": prompt}]
@@ -228,7 +243,7 @@ def agent_node(state: AgentState):
         )
     mistral_messages = [{"role": "user", "content": content}]
 
-    response = client.chat.complete(
+    response = safe_chat_complete(
         model=MODEL,
         messages=mistral_messages,
         tools=tools,
@@ -324,15 +339,15 @@ def critic_node(state: AgentState):
         }
 
     critic_prompt = f"""Be extremely strict. Review this answer: {last_answer}
-Check:
+Criteria:
 1. Did it follow EVERY step in the plan?
 2. Were ALL required tools used?
 3. Is the answer accurate, complete, and well-reasoned?
 4. Did it handle the image correctly?
-If ANY criterion fails -> say "NEEDS IMPROVEMENT" and explain exactly what is wrong.
+If ANY criterion fails -> say "NEEDS IMPROVEMENT" + explain exactly what is wrong.
 Only say "GOOD" if perfect in all areas."""
 
-    critique = client.chat.complete(
+    critique = safe_chat_complete(
         model=MODEL,
         messages=[{"role": "user", "content": critic_prompt}],
         max_tokens=300
@@ -376,7 +391,7 @@ Only say "GOOD" if perfect in all areas."""
 def summarize_memory(state: AgentState):
     messages = state["messages"]
     summary_prompt = f"Summarize key points from this conversation in 2-3 sentences:\n{messages[-5:]}"
-    summary = client.chat.complete(
+    summary = safe_chat_complete(
         model=MODEL,
         messages=[{"role": "user", "content": summary_prompt}],
         max_tokens=150
@@ -409,6 +424,100 @@ workflow.add_conditional_edges(
 workflow.add_edge("summarize", END)
 
 app = workflow.compile()
+
+
+def safe_chat_complete(**kwargs):
+    try:
+        return client.chat.complete(**kwargs)
+    except (httpx.ConnectTimeout, httpx.ReadTimeout, TimeoutError):
+        raise RuntimeError("Network timeout while contacting Mistral API. Please retry in a few seconds.")
+    except Exception as e:
+        # Keep original behavior for non-timeout errors.
+        raise RuntimeError(f"Mistral API request failed: {e}")
+
+
+def run_code_in_sandbox(user_code, timeout_seconds=12):
+    payload = json.dumps(user_code)
+    sandbox_script = f"""
+import io, contextlib, traceback, base64, json, os, time, pathlib
+user_code = {payload}
+sanitized_code = user_code.replace("plt.show()", "").replace("matplotlib.pyplot.show()", "")
+stdout_buffer = io.StringIO()
+local = {{"os": os, "time": time, "pathlib": pathlib}}
+allowed_roots = {{"math","statistics","numpy","matplotlib","seaborn","pandas","os","time","pathlib"}}
+real_import = __import__
+def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".")[0]
+    if root not in allowed_roots:
+        raise ImportError(f"Import '{{name}}' is blocked in sandbox.")
+    return real_import(name, globals, locals, fromlist, level)
+safe_builtins = {{
+    "__import__": safe_import,
+    "print": print,
+    "range": range,
+    "len": len,
+    "sum": sum,
+    "min": min,
+    "max": max,
+    "abs": abs,
+    "round": round,
+    "int": int,
+    "float": float,
+    "str": str,
+    "list": list,
+    "dict": dict,
+    "set": set,
+    "tuple": tuple,
+    "enumerate": enumerate,
+    "zip": zip,
+}}
+try:
+    with contextlib.redirect_stdout(stdout_buffer):
+        exec(sanitized_code, {{"__builtins__": safe_builtins}}, local)
+    output = stdout_buffer.getvalue().strip() or local.get("result", "Executed (no output)")
+    plot_note = ""
+    if "plt" in user_code.lower() or "matplotlib" in user_code.lower():
+        try:
+            import matplotlib.pyplot as plt
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            buf.seek(0)
+            img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+            plot_note = "\\nPlot generated successfully. Base64 image (truncated): " + img_base64[:100] + "...\\nFull plot saved in agent sandbox."
+        except Exception:
+            plot_note = "\\nPlot generation failed: " + traceback.format_exc(limit=2)
+        finally:
+            try:
+                plt.close("all")
+            except Exception:
+                pass
+    print("SANDBOX_RESULT:" + json.dumps({{"ok": True, "text": "Code output:\\n" + str(output) + plot_note}}))
+except Exception:
+    print("SANDBOX_RESULT:" + json.dumps({{"ok": False, "text": "Code error:\\n" + traceback.format_exc(limit=2)}}))
+"""
+    try:
+        completed = subprocess.run(
+            ["py", "-3.11", "-c", sandbox_script],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Code error: sandbox timeout after {timeout_seconds} seconds."
+    except Exception as e:
+        return f"Code error: sandbox launch failed: {e}"
+
+    lines = (completed.stdout or "").splitlines()
+    for line in reversed(lines):
+        if line.startswith("SANDBOX_RESULT:"):
+            try:
+                result = json.loads(line[len("SANDBOX_RESULT:"):])
+                return result.get("text", "Code error: unknown sandbox output.")
+            except Exception:
+                break
+    if completed.stderr:
+        return "Code error:\n" + completed.stderr.strip()
+    return "Code error: sandbox terminated without parsable output."
 
 
 def execute_tool(tool_call):
@@ -444,68 +553,15 @@ def execute_tool_by_name_and_args(name, raw_args):
                 with DDGS() as ddgs:
                     results = [r for r in ddgs.text(args["query"], max_results=3)]
             if not results:
-                return "No relevant results found."
-            summaries = [f"[{r['title']}] {r['body'][:300]}... ({r['href']})" for r in results]
-            return "\n\n".join(summaries)
+                return f"web_search(query={args.get('query', '')}) -> No relevant results found."
+            summaries = [f"- {r['title']}: {r['body'][:300]}... Source: {r['href']}" for r in results]
+            return f"web_search(query={args.get('query', '')}) results:\n" + "\n".join(summaries)
 
         elif name == "code_interpreter":
             user_code = args.get("code", "")
             if not isinstance(user_code, str) or not user_code.strip():
                 return "Code error: missing 'code' string."
-
-            # Avoid GUI calls in headless execution.
-            sanitized_code = user_code.replace("plt.show()", "").replace("matplotlib.pyplot.show()", "")
-            local = {}
-            f = io.StringIO()
-            safe_builtins = {
-                "__import__": __import__,
-                "print": print,
-                "range": range,
-                "len": len,
-                "sum": sum,
-                "min": min,
-                "max": max,
-                "abs": abs,
-                "round": round,
-                "int": int,
-                "float": float,
-                "str": str,
-                "list": list,
-                "dict": dict,
-                "set": set,
-                "tuple": tuple,
-                "enumerate": enumerate,
-                "zip": zip,
-            }
-            try:
-                with contextlib.redirect_stdout(f):
-                    exec(sanitized_code, {"__builtins__": safe_builtins}, local)
-                output = f.getvalue().strip() or local.get("result", "Executed (no output)")
-
-                plot_note = ""
-                if "plt" in user_code.lower() or "matplotlib" in user_code.lower():
-                    try:
-                        import matplotlib.pyplot as plt
-                        buf = io.BytesIO()
-                        try:
-                            plt.savefig(buf, format="png", bbox_inches="tight")
-                            buf.seek(0)
-                            img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-                            plot_note = (
-                                "\nPlot generated successfully. "
-                                f"Base64 image (truncated): {img_base64[:100]}...\n"
-                                "Full plot saved in agent environment."
-                            )
-                        except Exception:
-                            plot_note = "\nPlot generation failed: " + traceback.format_exc(limit=2)
-                        finally:
-                            plt.close("all")
-                    except Exception:
-                        plot_note = "\nPlot generation failed: " + traceback.format_exc(limit=2)
-
-                return f"Code output:\n{output}{plot_note}"
-            except Exception:
-                return "Code error:\n" + traceback.format_exc(limit=2)
+            return run_code_in_sandbox(user_code, timeout_seconds=SANDBOX_TIMEOUT_SECONDS)
 
         else:
             return "Unknown tool."
@@ -642,7 +698,15 @@ with gr.Blocks(title="Pixtral Vision Chat – Phase 1 Fixed") as demo:
         if image is not None:
             inputs["image_data"] = encode_image(image)
 
-        result = app.invoke(inputs, config={"recursion_limit": 80})
+        try:
+            result = app.invoke(inputs, config={"recursion_limit": 80})
+        except Exception as e:
+            error_reply = f"Temporary failure: {e}"
+            new_ui_history = (ui_history or []) + [
+                {"role": "user", "content": message or ""},
+                {"role": "assistant", "content": error_reply},
+            ]
+            return "", api_history or [], new_ui_history, new_ui_history, running_summary or "", ""
 
         final_reply = normalize_reply_content(result["messages"][-1].content)
         new_api_history = result["messages"]
@@ -666,4 +730,3 @@ with gr.Blocks(title="Pixtral Vision Chat – Phase 1 Fixed") as demo:
     )
 
 demo.launch(share=False)
-
