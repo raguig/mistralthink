@@ -69,16 +69,6 @@ client = Mistral(api_key=api_key)
 
 MODEL = "pixtral-large-latest"
 
-planner_prompt = ChatPromptTemplate.from_template(
-    """You are a helpful multimodal agent. Given the user query and any image context, create a clear step-by-step plan.
-    Use tools only when necessary (calculator for math, web_search for facts, code_interpreter for execution).
-    If the query asks for recent data, trends, or benchmarks, ALWAYS use web_search first.
-    If the query is simple, just answer directly.
-    
-    Current conversation summary: {summary}
-    User query: {query}
-    
-    Output ONLY the plan as numbered steps.""")
 
 # Tool schemas — Mistral expects OpenAI-compatible format
 tools = [
@@ -609,78 +599,6 @@ def is_math_query(text):
     return bool(re.search(r"[\d\)\]]\s*[\+\-\*/\^]\s*[\d\(\[]", t))
 
 
-def multimodal_chat(image, text, api_history):
-    messages = api_history.copy() if api_history else []
-    reply = "No final response generated."
-
-    current_content = [{"type": "text", "text": text or "Describe this image in detail."}]
-    if image is not None:
-        base64_img = encode_image(image)
-        current_content.append({
-            "type": "image_url",
-            "image_url": f"data:image/jpeg;base64,{base64_img}"
-        })
-
-    messages.append({"role": "user", "content": current_content})
-
-    force_calculator_for_math = is_math_query(text)
-    tool_choice = (
-        {"type": "function", "function": {"name": "calculator"}}
-        if force_calculator_for_math
-        else "auto"
-    )
-    max_tool_rounds = 3  # Prevent infinite loops
-    for round in range(max_tool_rounds):
-        try:
-            response = client.chat.complete(
-                model=MODEL,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                max_tokens=1024,
-                temperature=0.7
-            )
-            choice = response.choices[0]
-
-            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                # Add assistant tool-call message once, then add one tool result per call.
-                messages.append(choice.message.model_dump(exclude_none=True))
-                for tool_call in choice.message.tool_calls:
-                    tool_result = execute_tool(tool_call)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "content": tool_result
-                    })
-            else:
-                # Normal reply — done
-                reply = normalize_reply_content(choice.message.content)
-                messages.append({"role": "assistant", "content": reply})
-                break
-
-        except Exception as e:
-            reply = f"API Error in round {round+1}: {str(e)}"
-            messages.append({"role": "assistant", "content": reply})
-            break
-
-    # If every round used tools, run one final pass to produce plain assistant text.
-    if reply == "No final response generated.":
-        try:
-            final_response = client.chat.complete(
-                model=MODEL,
-                messages=messages,
-                max_tokens=1024,
-                temperature=0.7
-            )
-            final_choice = final_response.choices[0]
-            reply = normalize_reply_content(final_choice.message.content)
-            messages.append({"role": "assistant", "content": reply})
-        except Exception as e:
-            reply = f"API Error after tools: {str(e)}"
-            messages.append({"role": "assistant", "content": reply})
-
-    return messages, reply
 
 # Gradio UI
 with gr.Blocks(title="Pixtral Multimodal Agent") as demo:
@@ -754,12 +672,13 @@ with gr.Blocks(title="Pixtral Multimodal Agent") as demo:
                     except Exception:
                         pass
         
-        return "", new_api_history, new_ui_history, new_ui_history, new_summary, result.get("plan", ""), plot_image
+        return "", new_api_history, new_ui_history, new_ui_history, new_summary, result.get("plan", ""), plot_image, new_summary
+
 
     msg.submit(
         respond,
         inputs=[msg, img_input, api_state, chat_state, summary_state],
-        outputs=[msg, api_state, chat_state, chatbot, summary_state, plan_display, plot_display]
+        outputs=[msg, api_state, chat_state, chatbot, summary_state, plan_display, plot_display, summary_display]
     )
     
     clear.click(
