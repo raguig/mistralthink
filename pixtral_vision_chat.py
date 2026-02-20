@@ -67,6 +67,7 @@ MODEL = "pixtral-large-latest"
 planner_prompt = ChatPromptTemplate.from_template(
     """You are a helpful multimodal agent. Given the user query and any image context, create a clear step-by-step plan.
     Use tools only when necessary (calculator for math, web_search for facts, code_interpreter for execution).
+    If the query asks for recent data, trends, or benchmarks, ALWAYS use web_search first.
     If the query is simple, just answer directly.
     
     Current conversation summary: {summary}
@@ -131,7 +132,8 @@ def planner_node(state: AgentState):
     planning_text = (
         "You are a helpful multimodal agent. Given the user query and any image context, "
         "create a clear step-by-step plan. Use tools only when necessary (calculator for math, "
-        "web_search for facts, code_interpreter for execution). If the query is simple, just answer directly.\n\n"
+        "web_search for facts, code_interpreter for execution). If the query asks for recent data, trends, or benchmarks, "
+        "ALWAYS use web_search first. If the query is simple, just answer directly.\n\n"
         f"Current conversation summary: {summary}\n"
         f"User query: {query}\n\n"
         "Output ONLY the plan as numbered steps."
@@ -199,63 +201,32 @@ def agent_node(state: AgentState):
         else "auto"
     )
 
-    mistral_messages = [
-        {
-            "role": "system",
-            "content": (
-                "Follow the plan and complete the task end-to-end in this turn. "
-                "Do not say you will do a step later; either do it now with tool calls or explain the concrete tool error.\n"
-                "If asked to analyze trends, include a concise trend analysis. "
-                "If asked to search recent/similar data, perform web_search and cite key findings. "
-                "If asked to code and verify, run code_interpreter and report execution status.\n"
-                f"Plan:\n{plan}"
-            ),
-        }
-    ]
-
-    for i, msg in enumerate(messages):
+    convo_lines = []
+    for msg in messages[-12:]:
         if isinstance(msg, HumanMessage):
-            user_content = [{"type": "text", "text": str(msg.content)}]
-            # Attach image on the latest human turn when available.
-            if i == len(messages) - 1 and state.get("image_data"):
-                user_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/jpeg;base64,{state['image_data']}",
-                    }
-                )
-            mistral_messages.append({"role": "user", "content": user_content})
+            convo_lines.append(f"User: {msg.content}")
         elif isinstance(msg, AIMessage):
-            tool_calls = msg.additional_kwargs.get("tool_calls", [])
-            if tool_calls:
-                mistral_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": msg.content or "",
-                        "tool_calls": [
-                            {
-                                "id": tc.get("id"),
-                                "type": "function",
-                                "function": {
-                                    "name": tc.get("name"),
-                                    "arguments": tc.get("arguments", "{}"),
-                                },
-                            }
-                            for tc in tool_calls
-                        ],
-                    }
-                )
-            else:
-                mistral_messages.append({"role": "assistant", "content": str(msg.content)})
+            convo_lines.append(f"Assistant: {msg.content}")
         elif isinstance(msg, ToolMessage):
-            mistral_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": getattr(msg, "tool_call_id", ""),
-                    "name": getattr(msg, "name", ""),
-                    "content": str(msg.content),
-                }
-            )
+            convo_lines.append(f"Tool({getattr(msg, 'name', '')}): {msg.content}")
+
+    prompt = (
+        "Follow the plan and complete the task end-to-end in this turn. "
+        "Do not say you will do a step later; either do it now with tool calls or explain the concrete tool error.\n"
+        "If asked to analyze trends, include a concise trend analysis. "
+        "If asked to search recent/similar data, perform web_search and cite key findings. "
+        "If asked to code and verify, run code_interpreter and report execution status.\n\n"
+        f"Plan:\n{plan}\n\nConversation:\n" + "\n".join(convo_lines)
+    )
+    content = [{"type": "text", "text": prompt}]
+    if state.get("image_data"):
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": f"data:image/jpeg;base64,{state['image_data']}"
+            }
+        )
+    mistral_messages = [{"role": "user", "content": content}]
 
     response = client.chat.complete(
         model=MODEL,
@@ -352,8 +323,14 @@ def critic_node(state: AgentState):
             "retry_count": retry_count + 1,
         }
 
-    critic_prompt = f"""Review this answer: {last_answer}
-    Is it accurate, complete, and well-reasoned? Suggest improvements or confirm it's good."""
+    critic_prompt = f"""Be extremely strict. Review this answer: {last_answer}
+Check:
+1. Did it follow EVERY step in the plan?
+2. Were ALL required tools used?
+3. Is the answer accurate, complete, and well-reasoned?
+4. Did it handle the image correctly?
+If ANY criterion fails -> say "NEEDS IMPROVEMENT" and explain exactly what is wrong.
+Only say "GOOD" if perfect in all areas."""
 
     critique = client.chat.complete(
         model=MODEL,
@@ -361,7 +338,7 @@ def critic_node(state: AgentState):
         max_tokens=300
     ).choices[0].message.content
 
-    if "good" in critique.lower() or "excellent" in critique.lower():
+    if "GOOD" in critique.upper():
         return {
             "messages": [AIMessage(content=last_answer + "\n[Critique: Passed)]")],
             "needs_retry": False,
@@ -391,7 +368,7 @@ def critic_node(state: AgentState):
                     )
                 )
             ],
-            "plan": f"Improve based on critique: {critique}",
+            "plan": f"Revise and fix: {critique}",
             "needs_retry": True,
             "retry_count": retry_count + 1,
         }
@@ -472,11 +449,14 @@ def execute_tool_by_name_and_args(name, raw_args):
             return "\n\n".join(summaries)
 
         elif name == "code_interpreter":
-            # Controlled Python execution with captured stdout and limited builtins.
             user_code = args.get("code", "")
             if not isinstance(user_code, str) or not user_code.strip():
                 return "Code error: missing 'code' string."
 
+            # Avoid GUI calls in headless execution.
+            sanitized_code = user_code.replace("plt.show()", "").replace("matplotlib.pyplot.show()", "")
+            local = {}
+            f = io.StringIO()
             safe_builtins = {
                 "__import__": __import__,
                 "print": print,
@@ -497,36 +477,33 @@ def execute_tool_by_name_and_args(name, raw_args):
                 "enumerate": enumerate,
                 "zip": zip,
             }
-
-            exec_globals = {"__builtins__": safe_builtins}
-            exec_locals = {}
-            stdout_buffer = io.StringIO()
-
-            # Headless backend for plotting code.
-            prelude = (
-                "try:\n"
-                "    import warnings\n"
-                "    warnings.filterwarnings('ignore', message='.*FigureCanvasAgg is non-interactive, and thus cannot be shown.*', category=UserWarning)\n"
-                "    import matplotlib\n"
-                "    matplotlib.use('Agg')\n"
-                "except Exception:\n"
-                "    pass\n"
-            )
-
             try:
-                with contextlib.redirect_stdout(stdout_buffer):
-                    exec(prelude + "\n" + user_code, exec_globals, exec_locals)
+                with contextlib.redirect_stdout(f):
+                    exec(sanitized_code, {"__builtins__": safe_builtins}, local)
+                output = f.getvalue().strip() or local.get("result", "Executed (no output)")
 
-                printed = stdout_buffer.getvalue().strip()
-                result_value = exec_locals.get("result")
+                plot_note = ""
+                if "plt" in user_code.lower() or "matplotlib" in user_code.lower():
+                    try:
+                        import matplotlib.pyplot as plt
+                        buf = io.BytesIO()
+                        try:
+                            plt.savefig(buf, format="png", bbox_inches="tight")
+                            buf.seek(0)
+                            img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+                            plot_note = (
+                                "\nPlot generated successfully. "
+                                f"Base64 image (truncated): {img_base64[:100]}...\n"
+                                "Full plot saved in agent environment."
+                            )
+                        except Exception:
+                            plot_note = "\nPlot generation failed: " + traceback.format_exc(limit=2)
+                        finally:
+                            plt.close("all")
+                    except Exception:
+                        plot_note = "\nPlot generation failed: " + traceback.format_exc(limit=2)
 
-                if result_value is not None and printed:
-                    return f"Code output:\nresult={result_value}\nstdout:\n{printed}"
-                if result_value is not None:
-                    return f"Code output:\nresult={result_value}"
-                if printed:
-                    return f"Code output:\n{printed}"
-                return "Code executed successfully (no output)."
+                return f"Code output:\n{output}{plot_note}"
             except Exception:
                 return "Code error:\n" + traceback.format_exc(limit=2)
 
@@ -644,6 +621,7 @@ def multimodal_chat(image, text, api_history):
 with gr.Blocks(title="Pixtral Vision Chat – Phase 1 Fixed") as demo:
     gr.Markdown("# Pixtral Multimodal Agent – Phase 1\nUpload image + ask anything about it!")
     chatbot = gr.Chatbot(height=500)
+    plan_display = gr.Textbox(label="Current Agent Plan", interactive=False)
     msg = gr.Textbox(placeholder="Ask about the image (e.g., 'What trends do you see here?')", label="Your question")
     img_input = gr.Image(type="pil", label="Upload Image (JPEG/PNG)")
     clear = gr.Button("Clear Conversation")
@@ -673,18 +651,18 @@ with gr.Blocks(title="Pixtral Vision Chat – Phase 1 Fixed") as demo:
             {"role": "user", "content": message or ""},
             {"role": "assistant", "content": final_reply},
         ]
-        return "", new_api_history, new_ui_history, new_ui_history, new_summary
+        return "", new_api_history, new_ui_history, new_ui_history, new_summary, result.get("plan", "")
 
     msg.submit(
         respond,
         inputs=[msg, img_input, api_state, chat_state, summary_state],
-        outputs=[msg, api_state, chat_state, chatbot, summary_state]
+        outputs=[msg, api_state, chat_state, chatbot, summary_state, plan_display]
     )
     
     clear.click(
-        lambda: ("", [], [], [], ""),
+        lambda: ("", [], [], [], "", ""),
         None,
-        [msg, api_state, chat_state, chatbot, summary_state]
+        [msg, api_state, chat_state, chatbot, summary_state, plan_display]
     )
 
 demo.launch(share=False)
