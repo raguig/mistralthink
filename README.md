@@ -143,3 +143,7 @@ Open the local Gradio URL (typically `http://127.0.0.1:7860`).
 - `code_interpreter(code)`
   - executes Python in a constrained sandbox
   - captures matplotlib figures and returns them to the UI
+
+**Live Demo:** https://huggingface.co/spaces/medaminerag/pixtral-multimodal-agent
+
+Try it yourself — upload an image and ask anythin
