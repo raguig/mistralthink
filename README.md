@@ -146,4 +146,4 @@ Open the local Gradio URL (typically `http://127.0.0.1:7860`).
 
 **Live Demo:** https://huggingface.co/spaces/medaminerag/pixtral-multimodal-agent
 
-Try it yourself — upload an image and ask anythin
+Try it yourself, upload an image and ask anythin
