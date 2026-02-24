@@ -1,9 +1,3 @@
-"""
-Lightweight placeholder for future evaluation harness.
-Add deterministic test cases for tool usage, image persistence, and memory summary quality.
-"""
-
-
 def smoke_cases():
     return [
         {
