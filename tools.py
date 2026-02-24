@@ -102,7 +102,6 @@ def infer_required_tools(query_text: str):
 def infer_required_tools_from_plan(plan_text: str):
     p = (plan_text or "").lower()
     required = []
-    # Only accept explicit tool names from plan text to avoid keyword over-triggering.
     if "web_search" in p:
         required.append("web_search")
     if "code_interpreter" in p:
@@ -123,7 +122,6 @@ def execute_tool_by_name_and_args(name, raw_args):
     try:
         if name == "calculator":
             expression = str(args.get("expression", ""))
-            # User-facing math commonly uses ^ for exponentiation; Python uses **.
             expression = expression.replace("^", "**")
             safe_dict = {
                 k: v
